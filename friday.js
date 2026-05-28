@@ -442,8 +442,14 @@ async function publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState) {
 }
 
 async function safeReply(interaction, payload) {
-  if (interaction.replied || interaction.deferred) return interaction.followUp(payload);
-  return interaction.reply(payload);
+  try {
+    if (interaction.replied || interaction.deferred) {
+      return await interaction.followUp(payload);
+    }
+    return await interaction.reply(payload);
+  } catch (error) {
+    console.error("[ERRO_SEGURANCA] Falha ao responder interação:", error.message);
+  }
 }
 
 function isAdmin(interaction) {
