@@ -47,6 +47,19 @@ function writeJson(filePath, value) {
   }
 }
 
+// Debounced async writer para o STATE_FILE — evita I/O síncrono massivo em guilds ativas
+const _stateWriteTimers = new Map();
+function writeStateDebounced(delayMs = 2000) {
+  if (_stateWriteTimers.has(STATE_FILE)) clearTimeout(_stateWriteTimers.get(STATE_FILE));
+  _stateWriteTimers.set(
+    STATE_FILE,
+    setTimeout(() => {
+      _stateWriteTimers.delete(STATE_FILE);
+      writeJson(STATE_FILE, state);
+    }, delayMs).unref()
+  );
+}
+
 const db = readJson(CONFIG_FILE, { guilds: {} });
 const _rawState = readJson(STATE_FILE, {});
 const state = {
@@ -479,6 +492,8 @@ function isAdmin(interaction) {
 const onboardingSessions = new Map();
 const autoRoleBuildSessions = new Map();
 const AUTO_ROLE_BUILD_TTL_MS = 15 * 60 * 1000;
+// Lock por guild para evitar race condition na criação simultânea de salas de voz
+const voiceCreationLocks = new Set();
 
 function pruneAutoRoleBuildSessions() {
   const now = Date.now();
@@ -487,6 +502,23 @@ function pruneAutoRoleBuildSessions() {
       autoRoleBuildSessions.delete(buildId);
     }
   }
+}
+
+// Limpeza periódica do state: remove dados de anti-spam e atividade muito antiga
+function pruneState() {
+  const now = Date.now();
+  const cutoff = new Date(now - 90 * 24 * 60 * 60 * 1000).toISOString(); // 90 dias
+  for (const guildId of Object.keys(state.guilds)) {
+    const s = state.guilds[guildId];
+    // Remover registros de atividade com mais de 90 dias
+    for (const [userId, iso] of Object.entries(s.memberLastActivity || {})) {
+      if (iso < cutoff) delete s.memberLastActivity[userId];
+    }
+    // Buckets de anti-spam são temporários — limpar completamente no boot/diariamente
+    s.antiSpam = {};
+  }
+  writeJson(STATE_FILE, state);
+  console.log("[PRUNE] State limpo.");
 }
 
 async function sendNextOnboardingStep(interactionOrMessage, guild, userId) {
@@ -985,7 +1017,34 @@ async function reconcileTicketPanels() {
 
 function scheduleEdithRemoval(entry) {
   const ms = entry.expiresAt - Date.now();
-  if (ms <= 0) return;
+  if (ms <= 0) {
+    // Expirou enquanto o bot estava offline — remover imediatamente
+    (async () => {
+      try {
+        const guild = await client.guilds.fetch(entry.guildId).catch(() => null);
+        if (guild) {
+          const member = await guild.members.fetch(entry.userId).catch(() => null);
+          if (member?.roles.cache.has(entry.roleId)) {
+            await member.roles.remove(entry.roleId, "Protocolo EDITH expirado (reconciliacao offline)");
+          }
+          const owner = await client.users.fetch(entry.ownerId).catch(() => null);
+          if (owner) {
+            await owner
+              .send(`Protocolo EDITH encerrado (expirou offline) para <@${entry.userId}> em **${guild.name}**.`)
+              .catch(() => null);
+          }
+        }
+      } catch (e) {
+        console.error("[EDITH] reconcile offline:", e);
+      } finally {
+        state.edithDelegations = state.edithDelegations.filter(
+          (d) => !(d.guildId === entry.guildId && d.userId === entry.userId && d.expiresAt === entry.expiresAt)
+        );
+        writeJson(STATE_FILE, state);
+      }
+    })();
+    return;
+  }
   setTimeout(async () => {
     try {
       const guild = await client.guilds.fetch(entry.guildId);
@@ -1021,6 +1080,8 @@ client.once("clientReady", async () => {
   try { await reconcileTicketPanels(); } catch (e) { console.error("[READY] Falha ao reconciliar tickets:", e); }
   pruneAutoRoleBuildSessions();
   setInterval(pruneAutoRoleBuildSessions, 5 * 60 * 1000).unref();
+  pruneState();
+  setInterval(pruneState, 24 * 60 * 60 * 1000).unref();
   for (const d of state.edithDelegations) {
     try { scheduleEdithRemoval(d); } catch (e) { console.error("[READY] Falha ao agendar EDITH:", e); }
   }
@@ -1036,27 +1097,29 @@ client.on("guildMemberAdd", async (member) => {
     await member.roles.add(guildConfig.automation.boosterRoleId).catch(() => null);
   }
 
-  try {
-    console.log(
-      `[WELCOME] Novo membro detectado em ${member.guild.name}: ${member.user.tag} (${member.id})`
-    );
-    const text = formatWelcome(guildConfig.welcome.dmTemplate, member, guildConfig);
-    const rows = [];
-    if (guildConfig.onboarding.enabled) {
-      rows.push(
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`onboard:start:${member.guild.id}`)
-            .setLabel("Iniciar Onboarding")
-            .setStyle(ButtonStyle.Primary)
-        )
+  if (guildConfig.welcome.enabled) {
+    try {
+      console.log(
+        `[WELCOME] Novo membro detectado em ${member.guild.name}: ${member.user.tag} (${member.id})`
+      );
+      const text = formatWelcome(guildConfig.welcome.dmTemplate, member, guildConfig);
+      const rows = [];
+      if (guildConfig.onboarding.enabled) {
+        rows.push(
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`onboard:start:${member.guild.id}`)
+              .setLabel("Iniciar Onboarding")
+              .setStyle(ButtonStyle.Primary)
+          )
+        );
+      }
+      await member.send({ content: text, components: rows });
+    } catch (error) {
+      console.warn(
+        `[WELCOME] Nao foi possivel enviar DM para ${member.user.tag} (${member.id}): ${error?.message || error}`
       );
     }
-    await member.send({ content: text, components: rows });
-  } catch (error) {
-    console.warn(
-      `[WELCOME] Nao foi possivel enviar DM para ${member.user.tag} (${member.id}): ${error?.message || error}`
-    );
   }
 });
 
@@ -1085,7 +1148,7 @@ client.on("messageCreate", async (message) => {
     bucket.links.push(now);
   }
   guildState.antiSpam[bucketKey] = bucket;
-  writeJson(STATE_FILE, state);
+  writeStateDebounced(); // anti-spam: debounced para evitar I/O síncrono por mensagem
 
   const flood = bucket.hits.length >= 7;
   const links = bucket.links.length >= 4;
@@ -1106,14 +1169,29 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// Helper: busca audit log com delay para aguardar propagação da API do Discord
+async function safeAuditLookup(guild, type, targetId = null, delayMs = 800, maxAgeMs = 5000) {
+  await new Promise((r) => setTimeout(r, delayMs));
+  try {
+    const logs = await guild.fetchAuditLogs({ type, limit: 5 });
+    const entry = logs.entries.find(
+      (e) =>
+        (!targetId || e.target?.id === targetId) &&
+        Date.now() - e.createdTimestamp < maxAgeMs
+    );
+    return entry?.executorId || null;
+  } catch {
+    return null;
+  }
+}
+
 client.on("messageDelete", async (message) => {
   if (!message.guild) return;
   try {
-    const logs = await message.guild.fetchAuditLogs({ type: 72, limit: 1 });
-    const entry = logs.entries.first();
-    if (!entry?.executorId) return;
+    const executorId = await safeAuditLookup(message.guild, 72);
+    if (!executorId) return;
     const guildState = ensureGuildState(message.guild.id);
-    const stats = ensureStaffStats(guildState, entry.executorId);
+    const stats = ensureStaffStats(guildState, executorId);
     stats.deletedMessages += 1;
     writeJson(STATE_FILE, state);
   } catch (_) {}
@@ -1121,11 +1199,10 @@ client.on("messageDelete", async (message) => {
 
 client.on("guildBanAdd", async (ban) => {
   try {
-    const logs = await ban.guild.fetchAuditLogs({ type: 22, limit: 1 });
-    const entry = logs.entries.first();
-    if (!entry?.executorId) return;
+    const executorId = await safeAuditLookup(ban.guild, 22, ban.user?.id);
+    if (!executorId) return;
     const guildState = ensureGuildState(ban.guild.id);
-    const stats = ensureStaffStats(guildState, entry.executorId);
+    const stats = ensureStaffStats(guildState, executorId);
     stats.bans += 1;
     writeJson(STATE_FILE, state);
   } catch (_) {}
@@ -1134,11 +1211,11 @@ client.on("guildBanAdd", async (ban) => {
 client.on("guildMemberRemove", async (member) => {
   if (!member.guild) return;
   try {
-    const logs = await member.guild.fetchAuditLogs({ type: 20, limit: 1 });
-    const entry = logs.entries.first();
-    if (!entry?.executorId) return;
+    // Busca com target para garantir que é este membro — se não houver entry recente, foi saída voluntária
+    const executorId = await safeAuditLookup(member.guild, 20, member.id);
+    if (!executorId) return; // saída voluntária: sem entrada de kick → ignorar
     const guildState = ensureGuildState(member.guild.id);
-    const stats = ensureStaffStats(guildState, entry.executorId);
+    const stats = ensureStaffStats(guildState, executorId);
     stats.kicks += 1;
     writeJson(STATE_FILE, state);
   } catch (_) {}
@@ -1187,6 +1264,13 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         return;
       }
 
+      // Lock por guild: previne race condition com entradas simultâneas
+      if (voiceCreationLocks.has(guild.id)) {
+        await member.voice.disconnect("Aguarde, processando criacao de sala.").catch(() => null);
+        return;
+      }
+      voiceCreationLocks.add(guild.id);
+      try {
       const maxRooms = guildConfig.voiceCreator.maxActiveRooms || 0;
       const activeRooms = countActiveVoiceRooms(guildState);
       if (maxRooms > 0 && activeRooms >= maxRooms) {
@@ -1225,6 +1309,9 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         });
       } catch (_) {}
       await publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState).catch(() => null);
+      } finally {
+        voiceCreationLocks.delete(guild.id);
+      }
     }
 
     if (oldState.channelId && guildState.tempVoiceOwners[oldState.channelId]) {
@@ -2346,6 +2433,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (commandName === "inativos") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const reengajar = interaction.options.getBoolean("reengajar") || false;
       const members = await guild.members.fetch();
       const now = Date.now();
@@ -2353,7 +2441,16 @@ client.on("interactionCreate", async (interaction) => {
       for (const [, member] of members) {
         if (member.user.bot) continue;
         const last = guildState.memberLastActivity[member.id];
-        const lastMs = last ? new Date(last).getTime() : member.joinedTimestamp || now;
+        // Se joinedTimestamp for null (partial), usa now → dias = 0 → não entra no relatório corretamente.
+        // Preferir last activity; se ausente e joinedTimestamp disponível, usar joinedTimestamp; caso contrário ignorar.
+        let lastMs;
+        if (last) {
+          lastMs = new Date(last).getTime();
+        } else if (member.joinedTimestamp) {
+          lastMs = member.joinedTimestamp;
+        } else {
+          continue; // sem dados confiáveis — ignorar
+        }
         const days = Math.floor((now - lastMs) / (1000 * 60 * 60 * 24));
         if (days >= 7) data.push({ member, days });
       }
@@ -2362,17 +2459,19 @@ client.on("interactionCreate", async (interaction) => {
       if (!lines.length) lines.push("Nenhum inativo relevante.");
 
       if (reengajar) {
-        for (const item of data.filter((x) => x.days >= 30).slice(0, 20)) {
-          await item.member
-            .send(`Sentimos sua falta em **${guild.name}**. Quando quiser, estamos aqui.`)
-            .catch(() => null);
-        }
+        const reengageTargets = data.filter((x) => x.days >= 30).slice(0, 20);
+        await Promise.allSettled(
+          reengageTargets.map((item) =>
+            item.member
+              .send(`Sentimos sua falta em **${guild.name}**. Quando quiser, estamos aqui.`)
+              .catch(() => null)
+          )
+        );
       }
-      return safeReply(interaction, {
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder().setColor(COLORS.CYAN).setTitle("Inativos").setDescription(lines.join("\n")),
         ],
-        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2471,15 +2570,19 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`${mentions}\nMotivo: ${reason}\nSala: ${room}`),
         ],
       });
+      const dmTasks = [];
       for (const roleId of guildConfig.protocols.staffRoleIds) {
         const role = guild.roles.cache.get(roleId);
         if (!role) continue;
         for (const [, m] of role.members) {
-          await m
-            .send(`Convocacao emergencial em **${guild.name}**.\nMotivo: ${reason}\nSala: ${room.name}`)
-            .catch(() => null);
+          dmTasks.push(
+            m
+              .send(`Convocacao emergencial em **${guild.name}**.\nMotivo: ${reason}\nSala: ${room.name}`)
+              .catch(() => null)
+          );
         }
       }
+      await Promise.allSettled(dmTasks);
       return safeReply(interaction, { content: "Convocacao enviada.", flags: MessageFlags.Ephemeral });
     }
 
