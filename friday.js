@@ -442,14 +442,8 @@ async function publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState) {
 }
 
 async function safeReply(interaction, payload) {
-  try {
-    if (interaction.replied || interaction.deferred) {
-      return await interaction.followUp(payload);
-    }
-    return await interaction.reply(payload);
-  } catch (error) {
-    console.error("[ERRO_SEGURANCA] Falha ao responder interação:", error.message);
-  }
+  if (interaction.replied || interaction.deferred) return interaction.followUp(payload);
+  return interaction.reply(payload);
 }
 
 function isAdmin(interaction) {
@@ -1052,11 +1046,13 @@ client.on("messageCreate", async (message) => {
   guildState.memberLastActivity[message.author.id] = nowIso();
 
   const bucketKey = `${message.guild.id}:${message.author.id}`;
-  const bucket = guildState.antiSpam[bucketKey] || { hits: [], links: [] };
+  const bucket = guildState.antiSpam[bucketKey] || {};
+  if (!Array.isArray(bucket.hits)) bucket.hits = [];
+  if (!Array.isArray(bucket.links)) bucket.links = [];
   const now = Date.now();
   bucket.hits = bucket.hits.filter((t) => now - t < 7000);
   bucket.hits.push(now);
-  if (/https?:\/\/|discord\.gg\//i.test(message.content)) {
+  if (message.content && /https?:\/\/|discord\.gg\//i.test(message.content)) {
     bucket.links = bucket.links.filter((t) => now - t < 12000);
     bucket.links.push(now);
   }
