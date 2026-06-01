@@ -1103,18 +1103,7 @@ client.on("guildMemberAdd", async (member) => {
         `[WELCOME] Novo membro detectado em ${member.guild.name}: ${member.user.tag} (${member.id})`
       );
       const text = formatWelcome(guildConfig.welcome.dmTemplate, member, guildConfig);
-      const rows = [];
-      if (guildConfig.onboarding.enabled) {
-        rows.push(
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`onboard:start:${member.guild.id}`)
-              .setLabel("Iniciar Onboarding")
-              .setStyle(ButtonStyle.Primary)
-          )
-        );
-      }
-      await member.send({ content: text, components: rows });
+      await member.send({ content: text });
     } catch (error) {
       console.warn(
         `[WELCOME] Nao foi possivel enviar DM para ${member.user.tag} (${member.id}): ${error?.message || error}`
@@ -1785,7 +1774,9 @@ client.on("interactionCreate", async (interaction) => {
       }));
       const menu = new StringSelectMenuBuilder()
         .setCustomId(`autoRolePanel:${panelId}`)
-        .setPlaceholder("Clique para adicionar/remover cargo")
+        .setPlaceholder("Selecione um ou mais cargos")
+        .setMinValues(1)
+        .setMaxValues(options.length)
         .addOptions(options);
       const roleLines = selectedRoles.map((role) => `• ${role}: ${roleDescriptions[role.id] || ""}`);
       const descriptionText = `${session.description}\n\n${roleLines.join("\n")}`.slice(0, 4096);
@@ -1856,17 +1847,30 @@ client.on("interactionCreate", async (interaction) => {
         if (!panel) {
           return safeReply(interaction, { content: "Painel nao encontrado.", flags: MessageFlags.Ephemeral });
         }
-        const roleId = interaction.values[0];
-        const role = guild.roles.cache.get(roleId);
-        if (!role) return safeReply(interaction, { content: "Cargo invalido.", flags: MessageFlags.Ephemeral });
         const member = interaction.member;
         if (!member?.roles) return;
-        if (member.roles.cache.has(role.id)) {
-          await member.roles.remove(role.id).catch(() => null);
-          return safeReply(interaction, { content: `Cargo removido: ${role}`, flags: MessageFlags.Ephemeral });
+
+        const added = [];
+        const removed = [];
+        for (const roleId of interaction.values) {
+          const role = guild.roles.cache.get(roleId);
+          if (!role) continue;
+          if (member.roles.cache.has(role.id)) {
+            await member.roles.remove(role.id).catch(() => null);
+            removed.push(`${role}`);
+          } else {
+            await member.roles.add(role.id).catch(() => null);
+            added.push(`${role}`);
+          }
         }
-        await member.roles.add(role.id).catch(() => null);
-        return safeReply(interaction, { content: `Cargo adicionado: ${role}`, flags: MessageFlags.Ephemeral });
+
+        const lines = [];
+        if (added.length) lines.push(`✅ Adicionados: ${added.join(", ")}`);
+        if (removed.length) lines.push(`❌ Removidos: ${removed.join(", ")}`);
+        return safeReply(interaction, {
+          content: lines.join("\n") || "Nenhuma alteracao.",
+          flags: MessageFlags.Ephemeral,
+        });
       }
 
       if (kind === "voice" && parts[1] === "kick_select") {
