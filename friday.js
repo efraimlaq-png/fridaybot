@@ -10,6 +10,7 @@ const {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   Partials,
   PermissionFlagsBits,
@@ -47,11 +48,12 @@ function writeJson(filePath, value) {
 }
 
 const db = readJson(CONFIG_FILE, { guilds: {} });
-const state = readJson(STATE_FILE, {
-  guilds: {},
-  anonymousThreads: {},
-  edithDelegations: [],
-});
+const _rawState = readJson(STATE_FILE, {});
+const state = {
+  guilds: (_rawState.guilds && typeof _rawState.guilds === "object") ? _rawState.guilds : {},
+  anonymousThreads: (_rawState.anonymousThreads && typeof _rawState.anonymousThreads === "object") ? _rawState.anonymousThreads : {},
+  edithDelegations: Array.isArray(_rawState.edithDelegations) ? _rawState.edithDelegations : [],
+};
 
 function createGuildConfig() {
   return {
@@ -159,13 +161,33 @@ function ensureGuildConfig(guildId) {
   cfg.tickets.panelMessageId = cfg.tickets.panelMessageId || null;
   cfg.tickets.counter = Number.isInteger(cfg.tickets.counter) ? cfg.tickets.counter : 0;
 
+  cfg.autoRoles = cfg.autoRoles || {};
+  cfg.autoRoles.panels = Array.isArray(cfg.autoRoles.panels) ? cfg.autoRoles.panels : [];
+
+  cfg.protocols = cfg.protocols || {};
+  cfg.protocols.staffRoleIds = Array.isArray(cfg.protocols.staffRoleIds) ? cfg.protocols.staffRoleIds : [];
+
+  cfg.classes = cfg.classes || {};
+  cfg.classes.roleByClass = cfg.classes.roleByClass || {};
+
+  cfg.ouvidoria = cfg.ouvidoria || {};
+  cfg.ouvidoria.forumChannelId = cfg.ouvidoria.forumChannelId || null;
+
+  cfg.automation = cfg.automation || {};
+
   return db.guilds[guildId];
 }
 
 function ensureGuildState(guildId) {
   if (!state.guilds[guildId]) state.guilds[guildId] = createGuildState();
-  state.guilds[guildId].tickets = state.guilds[guildId].tickets || {};
-  return state.guilds[guildId];
+  const s = state.guilds[guildId];
+  if (!s.tickets || typeof s.tickets !== "object") s.tickets = {};
+  if (!s.antiSpam || typeof s.antiSpam !== "object") s.antiSpam = {};
+  if (!s.tempVoiceOwners || typeof s.tempVoiceOwners !== "object") s.tempVoiceOwners = {};
+  if (!s.memberLastActivity || typeof s.memberLastActivity !== "object") s.memberLastActivity = {};
+  if (!s.onboardingAnswers || typeof s.onboardingAnswers !== "object") s.onboardingAnswers = {};
+  if (!s.staffStats || typeof s.staffStats !== "object") s.staffStats = {};
+  return s;
 }
 
 function ensureStaffStats(guildState, userId) {
@@ -442,8 +464,12 @@ async function publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState) {
 }
 
 async function safeReply(interaction, payload) {
-  if (interaction.replied || interaction.deferred) return interaction.followUp(payload);
-  return interaction.reply(payload);
+  try {
+    if (interaction.replied || interaction.deferred) return await interaction.followUp(payload);
+    return await interaction.reply(payload);
+  } catch (e) {
+    console.error("[safeReply] Falha ao responder interacao:", e?.message || e);
+  }
 }
 
 function isAdmin(interaction) {
@@ -475,7 +501,7 @@ async function sendNextOnboardingStep(interactionOrMessage, guild, userId) {
     const payload = {
       content: "Onboarding finalizado com sucesso.",
       components: [],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     };
     if (interactionOrMessage.editReply) return interactionOrMessage.editReply(payload);
     if (interactionOrMessage.reply) return interactionOrMessage.reply(payload);
@@ -496,7 +522,7 @@ async function sendNextOnboardingStep(interactionOrMessage, guild, userId) {
     const payload = {
       content: `**${question.label}**\nSelecione uma opcao:`,
       components: [row],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     };
     if (interactionOrMessage.editReply) return interactionOrMessage.editReply(payload);
     if (interactionOrMessage.reply) return interactionOrMessage.reply(payload);
@@ -917,7 +943,7 @@ async function registerCommands() {
 }
 
 async function reconcileVoiceCreatorState() {
-  for (const [guildId] of Object.entries(state.guilds)) {
+  for (const [guildId] of Object.entries(state.guilds || {})) {
     const guild = await client.guilds.fetch(guildId).catch(() => null);
     if (!guild) continue;
     const guildState = ensureGuildState(guildId);
@@ -988,14 +1014,16 @@ function scheduleEdithRemoval(entry) {
   }, ms);
 }
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`[READY] ${client.user.tag} online`);
-  await registerCommands();
-  await reconcileVoiceCreatorState();
-  await reconcileTicketPanels();
+  try { await registerCommands(); } catch (e) { console.error("[READY] Falha ao registrar commands:", e); }
+  try { await reconcileVoiceCreatorState(); } catch (e) { console.error("[READY] Falha ao reconciliar voice:", e); }
+  try { await reconcileTicketPanels(); } catch (e) { console.error("[READY] Falha ao reconciliar tickets:", e); }
   pruneAutoRoleBuildSessions();
   setInterval(pruneAutoRoleBuildSessions, 5 * 60 * 1000).unref();
-  for (const d of state.edithDelegations) scheduleEdithRemoval(d);
+  for (const d of state.edithDelegations) {
+    try { scheduleEdithRemoval(d); } catch (e) { console.error("[READY] Falha ao agendar EDITH:", e); }
+  }
 });
 
 client.on("guildMemberAdd", async (member) => {
@@ -1220,16 +1248,16 @@ client.on("interactionCreate", async (interaction) => {
 
       if (kind === "onboard" && action === "start") {
         const guild = interaction.guild || (guildId ? await client.guilds.fetch(guildId) : null);
-        if (!guild) return safeReply(interaction, { content: "Guild invalida.", ephemeral: true });
+        if (!guild) return safeReply(interaction, { content: "Guild invalida.", flags: MessageFlags.Ephemeral });
         const guildConfig = ensureGuildConfig(guild.id);
         if (!guildConfig.onboarding.enabled) {
           return safeReply(interaction, {
             content: "Onboarding desativado.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         onboardingSessions.set(`${guild.id}:${interaction.user.id}`, { index: 0, answers: {} });
-        await safeReply(interaction, { content: "Iniciando onboarding...", ephemeral: true });
+        await safeReply(interaction, { content: "Iniciando onboarding...", flags: MessageFlags.Ephemeral });
         return sendNextOnboardingStep(interaction, guild, interaction.user.id);
       }
 
@@ -1239,7 +1267,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!isAdmin(interaction)) {
           return safeReply(interaction, {
             content: "Somente administradores podem usar esse painel.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const guildConfig = ensureGuildConfig(guild.id);
@@ -1269,7 +1297,7 @@ client.on("interactionCreate", async (interaction) => {
           await publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState).catch(() => null);
           return safeReply(interaction, {
             content: "Criacao de salas liberada para todos os membros.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
@@ -1277,7 +1305,7 @@ client.on("interactionCreate", async (interaction) => {
           await publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState).catch(() => null);
           return safeReply(interaction, {
             content: "Painel atualizado.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
       }
@@ -1293,7 +1321,7 @@ client.on("interactionCreate", async (interaction) => {
           if (!guildConfig.tickets.enabled) {
             return safeReply(interaction, {
               content: "Sistema de tickets nao esta configurado.",
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
           const existing = Object.entries(guildState.tickets).find(
@@ -1302,7 +1330,7 @@ client.on("interactionCreate", async (interaction) => {
           if (existing) {
             return safeReply(interaction, {
               content: `Voce ja possui ticket aberto: <#${existing[0]}>`,
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
 
@@ -1318,7 +1346,7 @@ client.on("interactionCreate", async (interaction) => {
           ) {
             return safeReply(interaction, {
               content: "Configuracao de tickets invalida. Rode /ticket_setup novamente.",
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
 
@@ -1395,7 +1423,7 @@ client.on("interactionCreate", async (interaction) => {
 
           return safeReply(interaction, {
             content: `Ticket criado: ${ticketChannel}`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
@@ -1403,27 +1431,27 @@ client.on("interactionCreate", async (interaction) => {
         if (!ticket) {
           return safeReply(interaction, {
             content: "Ticket nao encontrado no sistema.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const member = await guild.members.fetch(interaction.user.id).catch(() => null);
         if (!canManageTicket(member, guildConfig, ticket.ownerId)) {
           return safeReply(interaction, {
             content: "Voce nao tem permissao para essa acao no ticket.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const ticketChannel = guild.channels.cache.get(channelId);
         if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) {
           return safeReply(interaction, {
             content: "Canal do ticket nao encontrado.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
         if (action === "close") {
           if (ticket.status === "closed") {
-            return safeReply(interaction, { content: "Ticket ja esta fechado.", ephemeral: true });
+            return safeReply(interaction, { content: "Ticket ja esta fechado.", flags: MessageFlags.Ephemeral });
           }
           await ticketChannel.permissionOverwrites.edit(ticket.ownerId, {
             SendMessages: false,
@@ -1441,12 +1469,12 @@ client.on("interactionCreate", async (interaction) => {
             ],
             components: buildTicketControlPanel(guild.id, ticketChannel.id, true),
           });
-          return safeReply(interaction, { content: "Ticket fechado com sucesso.", ephemeral: true });
+          return safeReply(interaction, { content: "Ticket fechado com sucesso.", flags: MessageFlags.Ephemeral });
         }
 
         if (action === "reopen") {
           if (ticket.status === "open") {
-            return safeReply(interaction, { content: "Ticket ja esta aberto.", ephemeral: true });
+            return safeReply(interaction, { content: "Ticket ja esta aberto.", flags: MessageFlags.Ephemeral });
           }
           await ticketChannel.permissionOverwrites.edit(ticket.ownerId, {
             ViewChannel: true,
@@ -1465,7 +1493,7 @@ client.on("interactionCreate", async (interaction) => {
             ],
             components: buildTicketControlPanel(guild.id, ticketChannel.id, false),
           });
-          return safeReply(interaction, { content: "Ticket reaberto com sucesso.", ephemeral: true });
+          return safeReply(interaction, { content: "Ticket reaberto com sucesso.", flags: MessageFlags.Ephemeral });
         }
 
         if (action === "save") {
@@ -1473,7 +1501,7 @@ client.on("interactionCreate", async (interaction) => {
           if (!logsChannel || logsChannel.type !== ChannelType.GuildText) {
             return safeReply(interaction, {
               content: "Canal de registros nao configurado/invalido.",
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
           const transcript = await collectTicketTranscript(ticketChannel);
@@ -1488,7 +1516,7 @@ client.on("interactionCreate", async (interaction) => {
           writeJson(STATE_FILE, state);
           return safeReply(interaction, {
             content: `Registro enviado para ${logsChannel}.`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
       }
@@ -1501,17 +1529,17 @@ client.on("interactionCreate", async (interaction) => {
         if (!ownerId || ownerId !== interaction.user.id) {
           return safeReply(interaction, {
             content: "Somente o dono da sala pode usar.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const channel = guild.channels.cache.get(channelId);
         if (!channel || channel.type !== ChannelType.GuildVoice) {
-          return safeReply(interaction, { content: "Sala nao encontrada.", ephemeral: true });
+          return safeReply(interaction, { content: "Sala nao encontrada.", flags: MessageFlags.Ephemeral });
         }
 
         if (action === "lock") {
           await channel.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
-          return safeReply(interaction, { content: "Sala trancada.", ephemeral: true });
+          return safeReply(interaction, { content: "Sala trancada.", flags: MessageFlags.Ephemeral });
         }
 
         if (action === "rename") {
@@ -1553,7 +1581,7 @@ client.on("interactionCreate", async (interaction) => {
           if (!candidates.size) {
             return safeReply(interaction, {
               content: "Nao ha membros para ocultar.",
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
           const menu = new StringSelectMenuBuilder()
@@ -1568,7 +1596,7 @@ client.on("interactionCreate", async (interaction) => {
           return safeReply(interaction, {
             content: "Escolha para quem a sala ficara invisivel:",
             components: [new ActionRowBuilder().addComponents(menu)],
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
@@ -1577,7 +1605,7 @@ client.on("interactionCreate", async (interaction) => {
           if (!candidates.size) {
             return safeReply(interaction, {
               content: "Nao ha membros para expulsar.",
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
           }
           const menu = new StringSelectMenuBuilder()
@@ -1592,7 +1620,7 @@ client.on("interactionCreate", async (interaction) => {
           return safeReply(interaction, {
             content: "Escolha quem remover:",
             components: [new ActionRowBuilder().addComponents(menu)],
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
       }
@@ -1607,7 +1635,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!isAdmin(interaction)) {
           return safeReply(interaction, {
             content: "Somente administradores podem configurar o creator voice.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const guild =
@@ -1622,7 +1650,7 @@ client.on("interactionCreate", async (interaction) => {
         await publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState).catch(() => null);
         return safeReply(interaction, {
           content: "Cargos autorizados atualizados.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1633,15 +1661,15 @@ client.on("interactionCreate", async (interaction) => {
       if (!session) {
         return safeReply(interaction, {
           content: "Sessao expirada. Rode /auto_cargos novamente.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       if (interaction.user.id !== session.userId) {
-        return safeReply(interaction, { content: "Esse menu nao e seu.", ephemeral: true });
+        return safeReply(interaction, { content: "Esse menu nao e seu.", flags: MessageFlags.Ephemeral });
       }
       const guild = interaction.guild || (session.guildId ? await client.guilds.fetch(session.guildId) : null);
       if (!guild || guild.id !== session.guildId) {
-        return safeReply(interaction, { content: "Guild invalida para essa sessao.", ephemeral: true });
+        return safeReply(interaction, { content: "Guild invalida para essa sessao.", flags: MessageFlags.Ephemeral });
       }
       const guildConfig = ensureGuildConfig(guild.id);
 
@@ -1650,14 +1678,14 @@ client.on("interactionCreate", async (interaction) => {
         .map((id) => guild.roles.cache.get(id))
         .filter(Boolean);
       if (!selectedRoles.length) {
-        return safeReply(interaction, { content: "Nenhum cargo valido selecionado.", ephemeral: true });
+        return safeReply(interaction, { content: "Nenhum cargo valido selecionado.", flags: MessageFlags.Ephemeral });
       }
 
       const targetChannel = guild.channels.cache.get(session.channelId);
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
         return safeReply(interaction, {
           content: "Canal escolhido nao encontrado. Rode /auto_cargos novamente.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1713,7 +1741,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!session) {
           return safeReply(interaction, {
             content: "Sessao expirada. Clique para iniciar novamente.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const selected = interaction.values[0];
@@ -1739,19 +1767,19 @@ client.on("interactionCreate", async (interaction) => {
         const guildConfig = ensureGuildConfig(guild.id);
         const panel = guildConfig.autoRoles.panels.find((p) => p.panelId === panelId);
         if (!panel) {
-          return safeReply(interaction, { content: "Painel nao encontrado.", ephemeral: true });
+          return safeReply(interaction, { content: "Painel nao encontrado.", flags: MessageFlags.Ephemeral });
         }
         const roleId = interaction.values[0];
         const role = guild.roles.cache.get(roleId);
-        if (!role) return safeReply(interaction, { content: "Cargo invalido.", ephemeral: true });
+        if (!role) return safeReply(interaction, { content: "Cargo invalido.", flags: MessageFlags.Ephemeral });
         const member = interaction.member;
         if (!member?.roles) return;
         if (member.roles.cache.has(role.id)) {
           await member.roles.remove(role.id).catch(() => null);
-          return safeReply(interaction, { content: `Cargo removido: ${role}`, ephemeral: true });
+          return safeReply(interaction, { content: `Cargo removido: ${role}`, flags: MessageFlags.Ephemeral });
         }
         await member.roles.add(role.id).catch(() => null);
-        return safeReply(interaction, { content: `Cargo adicionado: ${role}`, ephemeral: true });
+        return safeReply(interaction, { content: `Cargo adicionado: ${role}`, flags: MessageFlags.Ephemeral });
       }
 
       if (kind === "voice" && parts[1] === "kick_select") {
@@ -1762,7 +1790,7 @@ client.on("interactionCreate", async (interaction) => {
         if (guildState.tempVoiceOwners[channelId] !== interaction.user.id) {
           return safeReply(interaction, {
             content: "Somente o dono da sala pode usar esse painel.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const channel = guild.channels.cache.get(channelId);
@@ -1773,7 +1801,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         return safeReply(interaction, {
           content: `Membro removido: <@${targetId}>`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1785,12 +1813,12 @@ client.on("interactionCreate", async (interaction) => {
         if (guildState.tempVoiceOwners[channelId] !== interaction.user.id) {
           return safeReply(interaction, {
             content: "Somente o dono da sala pode usar esse painel.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const channel = guild.channels.cache.get(channelId);
         if (!channel || channel.type !== ChannelType.GuildVoice) {
-          return safeReply(interaction, { content: "Sala nao encontrada.", ephemeral: true });
+          return safeReply(interaction, { content: "Sala nao encontrada.", flags: MessageFlags.Ephemeral });
         }
         const targetId = interaction.values[0];
         await channel.permissionOverwrites.edit(targetId, {
@@ -1803,7 +1831,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         return safeReply(interaction, {
           content: `A sala agora esta invisivel para <@${targetId}>.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
@@ -1824,7 +1852,7 @@ client.on("interactionCreate", async (interaction) => {
         const guildState = ensureGuildState(guild.id);
         guildState.onboardingAnswers[interaction.user.id] = session.answers;
         writeJson(STATE_FILE, state);
-        await safeReply(interaction, { content: "Resposta registrada.", ephemeral: true });
+        await safeReply(interaction, { content: "Resposta registrada.", flags: MessageFlags.Ephemeral });
         return sendNextOnboardingStep(interaction, guild, interaction.user.id);
       }
 
@@ -1835,19 +1863,19 @@ client.on("interactionCreate", async (interaction) => {
         if (guildState.tempVoiceOwners[key] !== interaction.user.id) {
           return safeReply(interaction, {
             content: "Somente o dono da sala pode alterar limite.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const channel = guild.channels.cache.get(key);
         if (!channel || channel.type !== ChannelType.GuildVoice) {
-          return safeReply(interaction, { content: "Sala invalida.", ephemeral: true });
+          return safeReply(interaction, { content: "Sala invalida.", flags: MessageFlags.Ephemeral });
         }
         const n = Number(interaction.fields.getTextInputValue("limit"));
         if (!Number.isInteger(n) || n < 0 || n > 99) {
-          return safeReply(interaction, { content: "Limite invalido.", ephemeral: true });
+          return safeReply(interaction, { content: "Limite invalido.", flags: MessageFlags.Ephemeral });
         }
         await channel.setUserLimit(n, "Ajuste via painel");
-        return safeReply(interaction, { content: `Limite atualizado para ${n}.`, ephemeral: true });
+        return safeReply(interaction, { content: `Limite atualizado para ${n}.`, flags: MessageFlags.Ephemeral });
       }
 
       if (kind === "voice" && action === "rename_modal") {
@@ -1857,21 +1885,21 @@ client.on("interactionCreate", async (interaction) => {
         if (guildState.tempVoiceOwners[key] !== interaction.user.id) {
           return safeReply(interaction, {
             content: "Somente o dono da sala pode renomear.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const channel = guild.channels.cache.get(key);
         if (!channel || channel.type !== ChannelType.GuildVoice) {
-          return safeReply(interaction, { content: "Sala invalida.", ephemeral: true });
+          return safeReply(interaction, { content: "Sala invalida.", flags: MessageFlags.Ephemeral });
         }
         const newName = interaction.fields.getTextInputValue("name").trim();
         if (!newName) {
-          return safeReply(interaction, { content: "Nome invalido.", ephemeral: true });
+          return safeReply(interaction, { content: "Nome invalido.", flags: MessageFlags.Ephemeral });
         }
         await channel.setName(newName.slice(0, 100), "Renomeada pelo dono da sala");
         return safeReply(interaction, {
           content: `Sala renomeada para **${newName.slice(0, 100)}**.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1881,7 +1909,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!isAdmin(interaction)) {
           return safeReply(interaction, {
             content: "Somente administradores podem alterar esse limite.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const guildConfig = ensureGuildConfig(guild.id);
@@ -1891,7 +1919,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!Number.isInteger(n) || n < 0 || n > 99) {
           return safeReply(interaction, {
             content: "Valor invalido. Use um numero entre 0 e 99.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         guildConfig.voiceCreator.maxActiveRooms = n;
@@ -1899,7 +1927,7 @@ client.on("interactionCreate", async (interaction) => {
         await publishOrRefreshVoiceAdminPanel(guild, guildConfig, guildState).catch(() => null);
         return safeReply(interaction, {
           content: `Limite global atualizado para ${n === 0 ? "Ilimitado" : n}.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1911,12 +1939,12 @@ client.on("interactionCreate", async (interaction) => {
         if (!forumId) {
           return safeReply(interaction, {
             content: "Forum nao configurado. Use /setup ouvidoria_forum.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         const forum = guild.channels.cache.get(forumId);
         if (!forum || forum.type !== ChannelType.GuildForum) {
-          return safeReply(interaction, { content: "Forum invalido.", ephemeral: true });
+          return safeReply(interaction, { content: "Forum invalido.", flags: MessageFlags.Ephemeral });
         }
         const subject = interaction.fields.getTextInputValue("subject");
         const body = interaction.fields.getTextInputValue("body");
@@ -1941,21 +1969,21 @@ client.on("interactionCreate", async (interaction) => {
         writeJson(STATE_FILE, state);
         return safeReply(interaction, {
           content: "Relato enviado com sucesso. Se houver resposta, ela chega por DM.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
 
     if (!interaction.isChatInputCommand()) return;
     const guild = interaction.guild;
-    if (!guild) return safeReply(interaction, { content: "Use no servidor.", ephemeral: true });
+    if (!guild) return safeReply(interaction, { content: "Use no servidor.", flags: MessageFlags.Ephemeral });
     const guildConfig = ensureGuildConfig(guild.id);
     const guildState = ensureGuildState(guild.id);
     const { commandName } = interaction;
 
     if (commandName === "setup") {
       if (!isAdmin(interaction)) {
-        return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+        return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       }
       const sub = interaction.options.getSubcommand();
 
@@ -1966,7 +1994,7 @@ client.on("interactionCreate", async (interaction) => {
         if (rulesChannel) guildConfig.welcome.rulesChannelId = rulesChannel.id;
         if (typeof enabled === "boolean") guildConfig.welcome.enabled = enabled;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: "Boas-vindas atualizadas.", ephemeral: true });
+        return safeReply(interaction, { content: "Boas-vindas atualizadas.", flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "onboarding_canal") {
@@ -1974,7 +2002,7 @@ client.on("interactionCreate", async (interaction) => {
         guildConfig.onboarding.panelChannelId = channel.id;
         guildConfig.onboarding.enabled = true;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Canal definido: ${channel}`, ephemeral: true });
+        return safeReply(interaction, { content: `Canal definido: ${channel}`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "onboarding_pergunta") {
@@ -1994,7 +2022,7 @@ client.on("interactionCreate", async (interaction) => {
         q.type = type;
         if (type === "select" && options.length) q.options = options.slice(0, 25);
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Pergunta ${key} salva.`, ephemeral: true });
+        return safeReply(interaction, { content: `Pergunta ${key} salva.`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "onboarding_mapeamento") {
@@ -2002,18 +2030,18 @@ client.on("interactionCreate", async (interaction) => {
         const answer = interaction.options.getString("resposta", true);
         const role = interaction.options.getRole("cargo", true);
         const q = guildConfig.onboarding.questions.find((x) => x.key === key);
-        if (!q) return safeReply(interaction, { content: "Pergunta nao encontrada.", ephemeral: true });
+        if (!q) return safeReply(interaction, { content: "Pergunta nao encontrada.", flags: MessageFlags.Ephemeral });
         q.roleMap = q.roleMap || {};
         q.roleMap[answer] = role.id;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Mapeado: ${answer} -> ${role}`, ephemeral: true });
+        return safeReply(interaction, { content: `Mapeado: ${answer} -> ${role}`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "ouvidoria_forum") {
         const channel = interaction.options.getChannel("canal", true);
         guildConfig.ouvidoria.forumChannelId = channel.id;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Forum definido: ${channel}`, ephemeral: true });
+        return safeReply(interaction, { content: `Forum definido: ${channel}`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "class_role") {
@@ -2021,7 +2049,7 @@ client.on("interactionCreate", async (interaction) => {
         const role = interaction.options.getRole("cargo", true);
         guildConfig.classes.roleByClass[className] = role.id;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Classe ${className} -> ${role}`, ephemeral: true });
+        return safeReply(interaction, { content: `Classe ${className} -> ${role}`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "protocolos") {
@@ -2034,14 +2062,14 @@ client.on("interactionCreate", async (interaction) => {
         guildConfig.protocols.meetingCategoryId = meetingCategory.id;
         guildConfig.protocols.staffRoleIds = parseRoleList(staffRaw);
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: "Protocolos salvos.", ephemeral: true });
+        return safeReply(interaction, { content: "Protocolos salvos.", flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "booster_role") {
         const role = interaction.options.getRole("cargo", true);
         guildConfig.automation.boosterRoleId = role.id;
         writeJson(CONFIG_FILE, db);
-        return safeReply(interaction, { content: `Booster role: ${role}`, ephemeral: true });
+        return safeReply(interaction, { content: `Booster role: ${role}`, flags: MessageFlags.Ephemeral });
       }
 
       if (sub === "ver") {
@@ -2061,19 +2089,19 @@ client.on("interactionCreate", async (interaction) => {
         ];
         return safeReply(interaction, {
           embeds: [new EmbedBuilder().setColor(COLORS.CYAN).setTitle("Setup").setDescription(lines.join("\n"))],
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
 
     if (commandName === "novos_membros") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       const channelId = guildConfig.onboarding.panelChannelId;
       const channel = channelId ? guild.channels.cache.get(channelId) : interaction.channel;
       if (!channel || channel.type !== ChannelType.GuildText) {
         return safeReply(interaction, {
           content: "Canal invalido. Configure com /setup onboarding_canal.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       await channel.send({
@@ -2092,11 +2120,11 @@ client.on("interactionCreate", async (interaction) => {
           ),
         ],
       });
-      return safeReply(interaction, { content: `Painel enviado em ${channel}.`, ephemeral: true });
+      return safeReply(interaction, { content: `Painel enviado em ${channel}.`, flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "dm_boas_vindas") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       const custom = interaction.options.getString("mensagem", true);
       guildConfig.welcome.dmTemplate = custom;
       guildConfig.welcome.enabled = true;
@@ -2104,12 +2132,12 @@ client.on("interactionCreate", async (interaction) => {
       return safeReply(interaction, {
         content:
           "Mensagem automatica salva. A partir de agora, todo novo membro recebera essa DM de boas-vindas.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (commandName === "auto_cargos") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       pruneAutoRoleBuildSessions();
       const channel = interaction.options.getChannel("canal", true);
       const title = interaction.options.getString("titulo", true);
@@ -2134,12 +2162,12 @@ client.on("interactionCreate", async (interaction) => {
         content:
           "Selecione agora os cargos no menu abaixo. Vou publicar o painel com titulo, descricao e detalhes por cargo no canal escolhido.",
         components: [new ActionRowBuilder().addComponents(menu)],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (commandName === "ticket_setup") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       const ticketsCategory = interaction.options.getChannel("categoria_tickets", true);
       const logsChannel = interaction.options.getChannel("canal_registros", true);
       const staffRole = interaction.options.getRole("cargo_staff", true);
@@ -2156,12 +2184,12 @@ client.on("interactionCreate", async (interaction) => {
       return safeReply(interaction, {
         content:
           `Sistema de tickets configurado.\nCategoria: ${ticketsCategory}\nRegistros: ${logsChannel}\nStaff: ${staffRole}\nPainel: ${panelChannel}`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (commandName === "ticket_painel") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       const channel = interaction.options.getChannel("canal", true);
       guildConfig.tickets.enabled = true;
       guildConfig.tickets.panelChannelId = channel.id;
@@ -2169,12 +2197,12 @@ client.on("interactionCreate", async (interaction) => {
       await publishOrRefreshTicketPanel(guild, guildConfig).catch(() => null);
       return safeReply(interaction, {
         content: `Painel de tickets publicado/atualizado em ${channel}.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (commandName === "creator_voice") {
-      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", ephemeral: true });
+      if (!isAdmin(interaction)) return safeReply(interaction, { content: "Apenas administradores.", flags: MessageFlags.Ephemeral });
       const category = interaction.options.getChannel("categoria", true);
       const masterName = guildConfig.voiceCreator.masterChannelName || "➕ criar-sala";
       let master = guild.channels.cache.get(guildConfig.voiceCreator.masterChannelId);
@@ -2227,7 +2255,7 @@ client.on("interactionCreate", async (interaction) => {
       return safeReply(interaction, {
         content:
           `Creator Voice configurado.\nCanal de criacao: ${master}\nPainel admin: ${adminText}`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2240,14 +2268,14 @@ client.on("interactionCreate", async (interaction) => {
       if (!ownerEntry) {
         return safeReply(interaction, {
           content: "Voce nao e dono de sala temporaria ativa.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       const channelId = ownerEntry[0];
       return safeReply(interaction, {
         content: "Painel privado:",
         components: buildVoiceOwnerPanel(guild.id, channelId),
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2259,7 +2287,7 @@ client.on("interactionCreate", async (interaction) => {
         await m.voice.setChannel(dest).catch(() => null);
         moved += 1;
       }
-      return safeReply(interaction, { content: `${moved} membro(s) movidos.`, ephemeral: true });
+      return safeReply(interaction, { content: `${moved} membro(s) movidos.`, flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "ouvidoria") {
@@ -2291,12 +2319,13 @@ client.on("interactionCreate", async (interaction) => {
       if (!roleId) {
         return safeReply(interaction, {
           content: "Classe sem mapeamento. Use /setup class_role.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       const role = guild.roles.cache.get(roleId);
-      if (!role) return safeReply(interaction, { content: "Cargo invalido.", ephemeral: true });
-      const member = await guild.members.fetch(interaction.user.id);
+      if (!role) return safeReply(interaction, { content: "Cargo invalido.", flags: MessageFlags.Ephemeral });
+      const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { content: "Membro nao encontrado.", flags: MessageFlags.Ephemeral });
       const allClassRoles = Object.values(guildConfig.classes.roleByClass).filter(Boolean);
       for (const id of allClassRoles) {
         if (id !== role.id && member.roles.cache.has(id)) {
@@ -2304,16 +2333,16 @@ client.on("interactionCreate", async (interaction) => {
         }
       }
       await member.roles.add(role.id).catch(() => null);
-      return safeReply(interaction, { content: `Classe definida: ${role}`, ephemeral: true });
+      return safeReply(interaction, { content: `Classe definida: ${role}`, flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "buscar_class") {
       const className = interaction.options.getString("classe", true);
       const reason = interaction.options.getString("motivo") || "Convocacao de evento";
       const roleId = guildConfig.classes.roleByClass[className];
-      if (!roleId) return safeReply(interaction, { content: "Classe nao mapeada.", ephemeral: true });
+      if (!roleId) return safeReply(interaction, { content: "Classe nao mapeada.", flags: MessageFlags.Ephemeral });
       await interaction.channel.send(`Convocacao: <@&${roleId}>\nMotivo: ${reason}`);
-      return safeReply(interaction, { content: "Convocacao enviada.", ephemeral: true });
+      return safeReply(interaction, { content: "Convocacao enviada.", flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "inativos") {
@@ -2343,7 +2372,7 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder().setColor(COLORS.CYAN).setTitle("Inativos").setDescription(lines.join("\n")),
         ],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2358,28 +2387,28 @@ client.on("interactionCreate", async (interaction) => {
       if (!lines.length) lines.push("Sem dados ainda.");
       return safeReply(interaction, {
         embeds: [new EmbedBuilder().setColor(COLORS.CYAN).setTitle("Staff Report").setDescription(lines.slice(0, 20).join("\n"))],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     if (commandName === "protocolo_veronica") {
       const targetUser = interaction.options.getUser("usuario", true);
       const target = await guild.members.fetch(targetUser.id).catch(() => null);
-      if (!target) return safeReply(interaction, { content: "Membro nao encontrado.", ephemeral: true });
+      if (!target) return safeReply(interaction, { content: "Membro nao encontrado.", flags: MessageFlags.Ephemeral });
       if (!guildConfig.protocols.quarantineRoleId || !guildConfig.protocols.containmentCategoryId) {
         return safeReply(interaction, {
           content: "Configure protocolos via /setup protocolos.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       const quarantineRole = guild.roles.cache.get(guildConfig.protocols.quarantineRoleId);
-      if (!quarantineRole) return safeReply(interaction, { content: "Cargo quarentena invalido.", ephemeral: true });
+      if (!quarantineRole) return safeReply(interaction, { content: "Cargo quarentena invalido.", flags: MessageFlags.Ephemeral });
       const remove = target.roles.cache.filter(
         (r) => r.id !== guild.roles.everyone.id && r.id !== quarantineRole.id
       );
       if (remove.size) await target.roles.remove(remove, "Protocolo Veronica").catch(() => null);
       await target.roles.add(quarantineRole.id, "Protocolo Veronica").catch(() => null);
-      if (target.voice.channelId) await target.voice.disconnect().catch(() => null);
+      if (target?.voice?.channelId) await target.voice.disconnect().catch(() => null);
 
       let containment = guildConfig.protocols.containmentChannelId
         ? guild.channels.cache.get(guildConfig.protocols.containmentChannelId)
@@ -2409,17 +2438,17 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`${target} isolado. Sala: ${containment}`),
         ],
       });
-      return safeReply(interaction, { content: "Concluido.", ephemeral: true });
+      return safeReply(interaction, { content: "Concluido.", flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "protocolo_festa_de_arromba") {
       const reason = interaction.options.getString("motivo", true);
       if (!guildConfig.protocols.meetingCategoryId || !guildConfig.protocols.staffRoleIds.length) {
-        return safeReply(interaction, { content: "Configure protocolos via /setup protocolos.", ephemeral: true });
+        return safeReply(interaction, { content: "Configure protocolos via /setup protocolos.", flags: MessageFlags.Ephemeral });
       }
       const category = guild.channels.cache.get(guildConfig.protocols.meetingCategoryId);
       if (!category || category.type !== ChannelType.GuildCategory) {
-        return safeReply(interaction, { content: "Categoria de reuniao invalida.", ephemeral: true });
+        return safeReply(interaction, { content: "Categoria de reuniao invalida.", flags: MessageFlags.Ephemeral });
       }
       const room = await guild.channels.create({
         name: `Reuniao-${Date.now()}`,
@@ -2451,7 +2480,7 @@ client.on("interactionCreate", async (interaction) => {
             .catch(() => null);
         }
       }
-      return safeReply(interaction, { content: "Convocacao enviada.", ephemeral: true });
+      return safeReply(interaction, { content: "Convocacao enviada.", flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "protocolo_tabua_rasa") {
@@ -2475,13 +2504,13 @@ client.on("interactionCreate", async (interaction) => {
         }
         return safeReply(interaction, {
           content: "Categoria duplicada limpa; backup mantido.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
       const originalName = current.name;
       await current.setName(`${originalName}-backup-${Date.now()}`).catch(() => null);
       await current.clone({ name: originalName, reason: "Protocolo Tabua Rasa" });
-      return safeReply(interaction, { content: "Canal limpo clonado; backup mantido.", ephemeral: true });
+      return safeReply(interaction, { content: "Canal limpo clonado; backup mantido.", flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === "protocolo_edith") {
@@ -2489,10 +2518,10 @@ client.on("interactionCreate", async (interaction) => {
       const raw = interaction.options.getString("tempo", true);
       const ms = parseDurationToMs(raw);
       if (!ms || ms < 60_000) {
-        return safeReply(interaction, { content: "Tempo invalido. Ex: 30m, 4h, 2d", ephemeral: true });
+        return safeReply(interaction, { content: "Tempo invalido. Ex: 30m, 4h, 2d", flags: MessageFlags.Ephemeral });
       }
       const target = await guild.members.fetch(targetUser.id).catch(() => null);
-      if (!target) return safeReply(interaction, { content: "Membro nao encontrado.", ephemeral: true });
+      if (!target) return safeReply(interaction, { content: "Membro nao encontrado.", flags: MessageFlags.Ephemeral });
       const role = await ensureEdithRole(guild, guildConfig);
       await target.roles.add(role.id, "Protocolo EDITH").catch(() => null);
       const entry = {
@@ -2513,7 +2542,7 @@ client.on("interactionCreate", async (interaction) => {
             .setTitle("Protocolo EDITH")
             .setDescription(`${target} recebeu admin temporario por ${raw}.`),
         ],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2528,7 +2557,7 @@ client.on("interactionCreate", async (interaction) => {
         if (Number.isNaN(ts)) {
           return safeReply(interaction, {
             content: "Data invalida. Use AAAA-MM-DD.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
         minDate = ts;
@@ -2546,7 +2575,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.channel.bulkDelete(under14days, true);
       return safeReply(interaction, {
         content: `Limpeza concluida: ${under14days.length} mensagens removidas.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -2554,18 +2583,18 @@ client.on("interactionCreate", async (interaction) => {
       const user = interaction.options.getUser("usuario", true);
       const member = await guild.members.fetch(user.id).catch(() => null);
       if (!member) {
-        return safeReply(interaction, { content: "Membro nao encontrado.", ephemeral: true });
+        return safeReply(interaction, { content: "Membro nao encontrado.", flags: MessageFlags.Ephemeral });
       }
       const rolesToRemove = member.roles.cache.filter((r) => r.id !== guild.roles.everyone.id);
       await member.roles.remove(rolesToRemove, "Reestruturacao");
-      return safeReply(interaction, { content: `Todos os cargos removidos de ${member}.`, ephemeral: true });
+      return safeReply(interaction, { content: `Todos os cargos removidos de ${member}.`, flags: MessageFlags.Ephemeral });
     }
   } catch (error) {
     console.error("[INTERACTION] Erro:", error);
     if (interaction.isRepliable()) {
       await safeReply(interaction, {
         content: "Ocorreu um erro ao processar a interacao.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       }).catch(() => null);
     }
   }
@@ -2593,6 +2622,18 @@ if (!process.env.DISCORD_TOKEN) {
   console.error("Defina DISCORD_TOKEN no .env. Opcional: GUILD_ID para registro rapido.");
   process.exit(1);
 }
+
+process.on("uncaughtException", (error) => {
+  console.error("[FATAL] uncaughtException:", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] unhandledRejection:", reason);
+});
+
+client.on("error", (error) => {
+  console.error("[CLIENT] Erro no websocket:", error);
+});
 
 client.login(process.env.DISCORD_TOKEN);
 
